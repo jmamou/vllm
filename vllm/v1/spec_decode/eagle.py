@@ -695,6 +695,11 @@ class SpecDecodeBaseProposer:
             hidden_states = hidden_states[:batch_size]
             logits = self.model.compute_logits(last_hidden_states[:batch_size])
             draft_token_ids = logits.argmax(dim=-1)
+            if self.spec_confidence_threshold > 0:
+                draft_probs = logits.softmax(dim=-1, dtype=torch.float32)
+                draft_token_ids_prob = draft_probs.gather(1, draft_token_ids.unsqueeze(1)).item()
+                if draft_token_ids_prob < self.spec_confidence_threshold:
+                    break
             draft_token_ids_list.append(draft_token_ids)
 
         # [batch_size, num_speculative_tokens]

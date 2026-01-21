@@ -52,6 +52,7 @@ def parse_args():
     )
     parser.add_argument("--backend", type=str, default="openai")
     parser.add_argument("--num-spec-tokens", type=int, default=2)
+    parser.add_argument("--spec-confidence-threshold", type=float, default=0.0)
     parser.add_argument("--prompt-lookup-max", type=int, default=5)
     parser.add_argument("--prompt-lookup-min", type=int, default=2)
     parser.add_argument("--tp", type=int, default=1)
@@ -132,6 +133,7 @@ def main(args):
             "method": args.method,
             "model": args.draft_model,
             "num_speculative_tokens": args.num_spec_tokens,
+            "spec_confidence_threshold": args.spec_confidence_threshold,
             "enforce_eager": args.enforce_eager,
             "max_model_len": args.max_model_len,
             "parallel_drafting": args.parallel_drafting,
