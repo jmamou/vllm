@@ -695,12 +695,29 @@ class SpecDecodeBaseProposer:
             hidden_states = hidden_states[:batch_size]
             logits = self.model.compute_logits(last_hidden_states[:batch_size])
             draft_token_ids = logits.argmax(dim=-1)
-            if self.spec_confidence_threshold > 0:
-                draft_probs = logits.softmax(dim=-1, dtype=torch.float32)
-                draft_token_ids_prob = draft_probs.gather(1, draft_token_ids.unsqueeze(1)).item()
-                if draft_token_ids_prob < self.spec_confidence_threshold:
-                    break
+            
+            # Always append the token first
             draft_token_ids_list.append(draft_token_ids)
+            
+            # Then check if we should stop early
+            if self.spec_confidence_threshold > 0 and (token_index + 1) < (self.num_speculative_tokens - 1):
+                draft_probs = logits.softmax(dim=-1, dtype=torch.float32)
+                draft_token_ids_prob = draft_probs.gather(1, draft_token_ids.unsqueeze(1)).squeeze().item()
+                logger.debug(
+                    f"[SpecDecode] Token {token_index + 1}/{self.num_speculative_tokens - 1}: "
+                    f"draft_prob={draft_token_ids_prob:.4f}, "
+                    f"threshold={self.spec_confidence_threshold:.4f}, "
+                    f"token_id={draft_token_ids.item()}"
+                )
+                # Stop generating more tokens if confidence is too low
+                # Note: We keep the current token but stop generating subsequent ones
+                if draft_token_ids_prob < self.spec_confidence_threshold:
+                    logger.debug(
+                        f"[SpecDecode] Early exit at token {token_index + 1}: "
+                        f"probability {draft_token_ids_prob:.4f} below threshold {self.spec_confidence_threshold:.4f}, "
+                        f"stopping further speculation"
+                    )
+                    break
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
