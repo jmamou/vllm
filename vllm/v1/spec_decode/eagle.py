@@ -99,6 +99,9 @@ class SpecDecodeBaseProposer:
         self.parallel_drafting_hidden_state_tensor: torch.Tensor | None = None
         if self.parallel_drafting:
             self._init_parallel_drafting_params()
+        self.use_local_argmax_reduction: bool = (
+            self.speculative_config.use_local_argmax_reduction
+        )
 
         max_batch_size = vllm_config.scheduler_config.max_num_seqs
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -369,6 +372,12 @@ class SpecDecodeBaseProposer:
 
         self.cudagraph_dispatcher.initialize_cudagraph_keys(eagle_cudagraph_mode)
 
+    def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Greedy-sample draft tokens from hidden states."""
+        if self.use_local_argmax_reduction:
+            return self.model.get_top_tokens(hidden_states)
+        return self.model.compute_logits(hidden_states).argmax(dim=-1)
+
     def propose(
         self,
         # [num_tokens]
@@ -491,11 +500,10 @@ class SpecDecodeBaseProposer:
                 last_hidden_states, hidden_states = ret_hidden_states
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
-        logits = self.model.compute_logits(sample_hidden_states)
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
-            draft_token_ids = logits.argmax(dim=-1)
+            draft_token_ids = self._greedy_sample(sample_hidden_states)
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
         if self.uses_mrope:
@@ -513,7 +521,8 @@ class SpecDecodeBaseProposer:
             hidden_states = hidden_states[token_indices_to_sample]
 
         if isinstance(attn_metadata, TreeAttentionMetadata):
-            # Draft using tree attention.
+            # Draft using tree attention - requires full logits for top-k
+            logits = self.model.compute_logits(sample_hidden_states)
             draft_token_ids_list = self.propose_tree(
                 batch_size=batch_size,
                 logits=logits,
@@ -525,7 +534,7 @@ class SpecDecodeBaseProposer:
             # [batch_size, num_tree_tokens]
             return torch.cat(draft_token_ids_list, dim=1)
 
-        draft_token_ids = logits.argmax(dim=-1)
+        draft_token_ids = self._greedy_sample(sample_hidden_states)
 
         if self.allowed_attn_types is not None and not isinstance(
             attn_metadata, self.allowed_attn_types
@@ -690,28 +699,35 @@ class SpecDecodeBaseProposer:
                     last_hidden_states, hidden_states = ret_hidden_states
 
             hidden_states = hidden_states[:batch_size]
-            logits = self.model.compute_logits(last_hidden_states[:batch_size])
-            draft_token_ids = logits.argmax(dim=-1)
-            
+            sample_hidden_states = last_hidden_states[:batch_size]
+            logits = None
+            if self.spec_confidence_threshold > 0:
+                logits = self.model.compute_logits(sample_hidden_states)
+                draft_token_ids = logits.argmax(dim=-1)
+            else:
+                draft_token_ids = self._greedy_sample(sample_hidden_states)
+
             # Always append the token first
             draft_token_ids_list.append(draft_token_ids)
             
             # Then check if we should stop early
             if self.spec_confidence_threshold > 0 and (token_index + 1) < (self.num_speculative_tokens - 1):
+                assert logits is not None
                 draft_probs = logits.softmax(dim=-1, dtype=torch.float32)
-                draft_token_ids_prob = draft_probs.gather(1, draft_token_ids.unsqueeze(1)).squeeze().item()
+                draft_token_ids_prob = draft_probs.gather(1, draft_token_ids.unsqueeze(1)).squeeze(-1)
+                should_exit = (draft_token_ids_prob < self.spec_confidence_threshold).any()
                 logger.debug(
                     f"[SpecDecode] Token {token_index + 1}/{self.num_speculative_tokens - 1}: "
-                    f"draft_prob={draft_token_ids_prob:.4f}, "
+                    f"draft_prob_min={draft_token_ids_prob.min().item():.4f}, "
                     f"threshold={self.spec_confidence_threshold:.4f}, "
-                    f"token_id={draft_token_ids.item()}"
+                    f"token_id={draft_token_ids[0].item() if draft_token_ids.numel() > 0 else -1}"
                 )
                 # Stop generating more tokens if confidence is too low
                 # Note: We keep the current token but stop generating subsequent ones
-                if draft_token_ids_prob < self.spec_confidence_threshold:
+                if should_exit:
                     logger.debug(
                         f"[SpecDecode] Early exit at token {token_index + 1}: "
-                        f"probability {draft_token_ids_prob:.4f} below threshold {self.spec_confidence_threshold:.4f}, "
+                        f"min probability {draft_token_ids_prob.min().item():.4f} below threshold {self.spec_confidence_threshold:.4f}, "
                         f"stopping further speculation"
                     )
                     break
@@ -1542,6 +1558,31 @@ class SpecDecodeBaseProposer:
                         logger.info(
                             "Shared target model lm_head with MTP shared_head.head."
                         )
+
+        if self.use_local_argmax_reduction:
+            if not hasattr(self.model, "get_top_tokens"):
+                raise ValueError(
+                    "use_local_argmax_reduction is enabled but draft model "
+                    f"{self.model.__class__.__name__} does not implement "
+                    "get_top_tokens()."
+                )
+            # Warn if draft model has vocab remapping, which forces fallback
+            # to the full-logits path (negating the optimization).
+            if (
+                hasattr(self.model, "draft_id_to_target_id")
+                and self.model.draft_id_to_target_id is not None
+            ):
+                logger.warning(
+                    "use_local_argmax_reduction is enabled but draft model "
+                    "uses draft_id_to_target_id vocab remapping. The "
+                    "optimization will be bypassed (falling back to full "
+                    "logits gather + argmax)."
+                )
+            else:
+                logger.info(
+                    "Using local argmax reduction for draft token generation "
+                    "(communication: O(2*tp_size) vs O(vocab_size))."
+                )
 
     @torch.inference_mode()
     def dummy_run(
