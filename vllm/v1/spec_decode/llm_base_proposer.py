@@ -438,8 +438,9 @@ class SpecDecodeBaseProposer:
             return token_ids, confidences
 
         logits = self.model.compute_logits(hidden_states)
-        probs = torch.softmax(logits, dim=-1)
-        confidences, token_ids = torch.max(probs, dim=-1)
+        max_logits, token_ids = logits.max(dim=-1)
+        log_z = torch.logsumexp(logits, dim=-1)
+        confidences = torch.exp(max_logits - log_z)
         return token_ids, confidences
 
     def propose(
@@ -677,21 +678,19 @@ class SpecDecodeBaseProposer:
             draft_token_ids_list.append(draft_token_ids)
 
         # [batch_size, num_speculative_tokens]
-        # With DSL, we might have fewer than num_speculative_tokens tokens
-        # Pad with zeros (rejection sampler will ignore these since they'll have 0 probability)
-        actual_k = len(draft_token_ids_list)
-        if actual_k < self.num_speculative_tokens:
-            # Pad with zeros to match expected shape
-            padding_needed = self.num_speculative_tokens - actual_k
-            for _ in range(padding_needed):
-                pad_tokens = torch.zeros(
-                    batch_size,
-                    dtype=draft_token_ids_list[0].dtype,
-                    device=self.device,
-                )
-                draft_token_ids_list.append(pad_tokens)
-
+        # With DSL we may have produced fewer than num_speculative_tokens
+        # tokens; pad with zeros so the output shape stays fixed (the
+        # rejection sampler ignores these since they carry zero probability).
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+        actual_k = draft_token_ids.shape[1]
+        if actual_k < self.num_speculative_tokens:
+            pad = torch.zeros(
+                batch_size,
+                self.num_speculative_tokens - actual_k,
+                dtype=draft_token_ids.dtype,
+                device=self.device,
+            )
+            draft_token_ids = torch.cat([draft_token_ids, pad], dim=1)
         if draft_probs_list is not None:
             self._last_draft_probs = torch.stack(draft_probs_list, dim=1).contiguous()
         return draft_token_ids
