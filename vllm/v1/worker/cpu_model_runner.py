@@ -176,13 +176,25 @@ class CPUModelRunner(GPUModelRunner):
     def _get_draft_token_ids_cpu(self) -> tuple[list[list[int]], list[str]]:
         """CPU-safe version: no event synchronization needed."""
         if isinstance(self._draft_token_ids, list):
-            return self._draft_token_ids, self.input_batch.req_ids
-        req_ids = self._draft_token_req_ids
-        if req_ids is None:
-            return [], []
-        if self.draft_token_ids_cpu is not None:
-            return self.draft_token_ids_cpu[: len(req_ids)].tolist(), req_ids
-        return [], []
+            draft_token_ids: list[list[int]] = self._draft_token_ids
+            req_ids: list[str] = self.input_batch.req_ids
+        else:
+            cached_req_ids = self._draft_token_req_ids
+            if cached_req_ids is None or self.draft_token_ids_cpu is None:
+                return [], []
+            req_ids = cached_req_ids
+            draft_token_ids = self.draft_token_ids_cpu[: len(req_ids)].tolist()
+
+        # DSL: trim zero-padded suffix so the scheduler does not waste target
+        # compute verifying fake tokens (and metrics aren't biased low).
+        actual_k = getattr(
+            getattr(self, "drafter", None),
+            "_last_draft_token_count",
+            self.num_spec_tokens,
+        )
+        if actual_k < self.num_spec_tokens:
+            draft_token_ids = [row[:actual_k] for row in draft_token_ids]
+        return draft_token_ids, req_ids
 
     def _copy_valid_sampled_token_count(
         self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor

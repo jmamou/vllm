@@ -77,7 +77,7 @@ class SpecDecodeBaseProposer:
         self.draft_confidence_threshold = (
             self.speculative_config.draft_confidence_threshold
         )
-        self.use_dsl = self.draft_confidence_threshold is not None
+        self.use_dsl = self.draft_confidence_threshold > 0
 
         # We need to get the hidden size from the draft model config because
         # the draft model's hidden size can be different from the target model's
@@ -236,6 +236,12 @@ class SpecDecodeBaseProposer:
             and self.speculative_config.draft_sample_method == "probabilistic"
         )
         self._last_draft_probs: torch.Tensor | None = None
+        # DSL: actual number of draft tokens produced in the most recent
+        # propose() call. Equal to num_speculative_tokens unless DSL exited
+        # early. Downstream (model_runner.take_draft_token_ids) uses this
+        # to trim zero-padded rows so the scheduler does not waste target
+        # compute verifying fake tokens.
+        self._last_draft_token_count: int = self.num_speculative_tokens
 
         self._slot_mapping_buffer = torch.zeros(
             self.max_positions,
@@ -463,6 +469,7 @@ class SpecDecodeBaseProposer:
         | None = None,
     ) -> torch.Tensor:
         self._last_draft_probs = None
+        self._last_draft_token_count = self.num_speculative_tokens
         batch_size = common_attn_metadata.batch_size()
 
         if self.method in ("eagle3", "dflash"):
@@ -679,10 +686,12 @@ class SpecDecodeBaseProposer:
 
         # [batch_size, num_speculative_tokens]
         # With DSL we may have produced fewer than num_speculative_tokens
-        # tokens; pad with zeros so the output shape stays fixed (the
-        # rejection sampler ignores these since they carry zero probability).
+        # tokens; pad with zeros so the output shape stays fixed and record
+        # the actual count so the model runner can trim padded rows before
+        # returning them to the scheduler.
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
         actual_k = draft_token_ids.shape[1]
+        self._last_draft_token_count = actual_k
         if actual_k < self.num_speculative_tokens:
             pad = torch.zeros(
                 batch_size,
