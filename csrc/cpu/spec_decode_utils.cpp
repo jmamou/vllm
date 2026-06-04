@@ -2,6 +2,11 @@
 
 #include <algorithm>
 
+// Threshold below which OMP parallel-for overhead exceeds the work itself.
+// For speculative decoding at BS=1, spawning threads for trivial loops wastes
+// cycles on fork/join synchronization.
+constexpr int64_t OMP_PARALLEL_THRESHOLD = 4;
+
 namespace cpu_utils {
 
 void eagle_prepare_inputs_padded_kernel_impl(
@@ -17,7 +22,7 @@ void eagle_prepare_inputs_padded_kernel_impl(
   int32_t* indices_out_ptr = token_indices_to_sample.data_ptr<int32_t>();
   int64_t* rejected_out_ptr = num_rejected_tokens_gpu.data_ptr<int64_t>();
 
-#pragma omp parallel for
+#pragma omp parallel for if (num_reqs > OMP_PARALLEL_THRESHOLD)
   for (int64_t req_idx = 0; req_idx < num_reqs; ++req_idx) {
     int64_t start_idx = req_idx == 0 ? 0 : cu_draft_ptr[req_idx - 1];
     int64_t num_draft_tokens = cu_draft_ptr[req_idx] - start_idx;
@@ -50,7 +55,7 @@ void eagle_prepare_next_token_padded_kernel_impl(
 
   const int64_t stride = sampled_token_ids.stride(0);
 
-#pragma omp parallel for
+#pragma omp parallel for if (num_reqs > OMP_PARALLEL_THRESHOLD)
   for (int64_t req_idx = 0; req_idx < num_reqs; ++req_idx) {
     const int64_t* row_ptr = sampled_ids_ptr + req_idx * stride;
     int64_t valid_count = 0;
@@ -93,7 +98,7 @@ void eagle_step_slot_mapping_metadata_kernel_impl(
   const int64_t bt_stride = block_table.stride(0);
   const int64_t n_blocks_per_req = block_table.size(1);
 
-#pragma omp parallel for
+#pragma omp parallel for if (input_batch_size > OMP_PARALLEL_THRESHOLD)
   for (int64_t req_idx = 0; req_idx < input_batch_size; ++req_idx) {
     if (req_idx >= batch_size) {
       out_slot_ptr[req_idx] = PAD_ID;
@@ -147,7 +152,7 @@ void copy_and_expand_eagle_inputs_kernel_impl(
   int32_t* out_new_idx_ptr = out_new_token_indices.data_ptr<int32_t>();
   int32_t* out_hidden_map_ptr = out_hidden_state_mapping.data_ptr<int32_t>();
 
-#pragma omp parallel for
+#pragma omp parallel for if (num_reqs > OMP_PARALLEL_THRESHOLD)
   for (int64_t req_idx = 0; req_idx < num_reqs; ++req_idx) {
     int32_t q_start = query_start_ptr[req_idx];
     int32_t next_q_start = query_start_ptr[req_idx + 1];
@@ -226,7 +231,7 @@ void rejection_greedy_sample_kernel_impl(
   const int64_t out_stride = output_token_ids.stride(0);
   const int64_t bonus_stride = bonus_token_ids.stride(0);
 
-#pragma omp parallel for
+#pragma omp parallel for if (batch_size > OMP_PARALLEL_THRESHOLD)
   for (int64_t req_idx = 0; req_idx < batch_size; ++req_idx) {
     if (greedy_ptr && !greedy_ptr[req_idx]) continue;
 
@@ -281,7 +286,7 @@ void rejection_random_sample_kernel_impl(
   const int64_t draft_probs_stride =
       no_draft_probs ? 0 : draft_probs.value().stride(0);
 
-#pragma omp parallel for
+#pragma omp parallel for if (batch_size > OMP_PARALLEL_THRESHOLD)
   for (int64_t req_idx = 0; req_idx < batch_size; ++req_idx) {
     if (greedy_ptr && greedy_ptr[req_idx]) continue;
 
@@ -328,7 +333,7 @@ void expand_kernel_impl(torch::Tensor& output, const torch::Tensor& input,
   int64_t* out_ptr = output.data_ptr<int64_t>();
   const int64_t* in_ptr = input.data_ptr<int64_t>();
 
-#pragma omp parallel for
+#pragma omp parallel for if (batch_size > OMP_PARALLEL_THRESHOLD)
   for (int64_t req_idx = 0; req_idx < batch_size; ++req_idx) {
     int64_t start_idx = req_idx == 0 ? 0 : cu_tokens_ptr[req_idx - 1];
     int64_t end_idx = cu_tokens_ptr[req_idx];
@@ -365,44 +370,56 @@ void sample_recovered_tokens_kernel_impl(
       no_draft_probs ? 0 : draft_probs.value().stride(0);
   const int64_t inv_q_stride = inv_q.stride(0);
 
-#pragma omp parallel for
-  for (int64_t req_idx = 0; req_idx < batch_size; ++req_idx) {
-    int64_t start_idx = req_idx == 0 ? 0 : cu_draft_ptr[req_idx - 1];
-    int64_t end_idx = cu_draft_ptr[req_idx];
-    int64_t num_draft_tokens = end_idx - start_idx;
+  // sample_recovered_tokens is compute-intensive (O(vocab_size) per token),
+  // so parallelize over draft tokens rather than requests for better load
+  // balance.
+  int64_t total_draft_tokens =
+      batch_size > 0 ? cu_draft_ptr[batch_size - 1] : 0;
 
-    const float* req_inv_q = inv_q_ptr + req_idx * inv_q_stride;
-
-    for (int64_t pos = 0; pos < num_draft_tokens; ++pos) {
-      int64_t token_idx = start_idx + pos;
-      int64_t draft_id = draft_ids_ptr[token_idx];
-
-      const float* token_target_probs =
-          target_probs_ptr + token_idx * target_stride;
-      const float* token_draft_probs =
-          no_draft_probs ? nullptr
-                         : (draft_probs_ptr + token_idx * draft_probs_stride);
-
-      int64_t best_id = 0;
-      float best_val = -1.0f;
-
-      for (int64_t v = 0; v < vocab_size; ++v) {
-        float prob = token_target_probs[v];
-        if (no_draft_probs) {
-          if (v == draft_id) prob = 0.0f;
+#pragma omp parallel for if (total_draft_tokens > OMP_PARALLEL_THRESHOLD)
+  for (int64_t token_idx = 0; token_idx < total_draft_tokens; ++token_idx) {
+    // Binary search to find which request this token belongs to
+    int64_t req_idx = 0;
+    {
+      int64_t lo = 0, hi = batch_size;
+      while (lo < hi) {
+        int64_t mid = (lo + hi) / 2;
+        if (cu_draft_ptr[mid] <= token_idx) {
+          lo = mid + 1;
         } else {
-          float diff = prob - token_draft_probs[v];
-          prob = diff > 0.0f ? diff : 0.0f;
-        }
-
-        float val = prob * req_inv_q[v];
-        if (val > best_val) {
-          best_val = val;
-          best_id = v;
+          hi = mid;
         }
       }
-      out_ptr[token_idx] = best_id;
+      req_idx = lo;
     }
+
+    int64_t draft_id = draft_ids_ptr[token_idx];
+    const float* token_target_probs =
+        target_probs_ptr + token_idx * target_stride;
+    const float* token_draft_probs =
+        no_draft_probs ? nullptr
+                       : (draft_probs_ptr + token_idx * draft_probs_stride);
+    const float* req_inv_q = inv_q_ptr + req_idx * inv_q_stride;
+
+    int64_t best_id = 0;
+    float best_val = -1.0f;
+
+    for (int64_t v = 0; v < vocab_size; ++v) {
+      float prob = token_target_probs[v];
+      if (no_draft_probs) {
+        if (v == draft_id) prob = 0.0f;
+      } else {
+        float diff = prob - token_draft_probs[v];
+        prob = diff > 0.0f ? diff : 0.0f;
+      }
+
+      float val = prob * req_inv_q[v];
+      if (val > best_val) {
+        best_val = val;
+        best_id = v;
+      }
+    }
+    out_ptr[token_idx] = best_id;
   }
 }
 

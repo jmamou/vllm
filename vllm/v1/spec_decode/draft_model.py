@@ -55,9 +55,16 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         base = super()._create_draft_vllm_config()
         spec = self.speculative_config
 
+        # On CPU, allow quantization for the draft model (e.g. INT8 weight-only)
+        # to reduce memory bandwidth which is the primary bottleneck at BS=1.
+        # On GPU, quantization is disabled to preserve acceptance rate.
+        quant_config = None
+        if self.device == torch.device("cpu"):
+            quant_config = base.quant_config
+
         return replace(
             base,
-            quant_config=None,
+            quant_config=quant_config,
             parallel_config=replace(
                 spec.draft_parallel_config,
                 rank=self.vllm_config.parallel_config.rank,
@@ -79,10 +86,43 @@ class DraftModelProposer(SpecDecodeBaseProposer):
 
     @override
     def _maybe_share_embeddings(self, target_language_model: nn.Module) -> None:
-        # Draft models don't share embeddings with the target model
-        pass
+        if self.device != torch.device("cpu"):
+            return
+        # On CPU, sharing embeddings saves memory bandwidth (the embedding
+        # table stays in LLC instead of being duplicated in DRAM).
+        # Only share if hidden dimensions match (same embedding width).
+        target_inner = getattr(target_language_model, "model", None)
+        if target_inner is None:
+            return
+        target_embed = getattr(target_inner, "embed_tokens", None) or getattr(
+            target_inner, "embedding", None
+        )
+        draft_embed = getattr(getattr(self.model, "model", None), "embed_tokens", None)
+        if (
+            target_embed is not None
+            and draft_embed is not None
+            and hasattr(target_embed, "weight")
+            and hasattr(draft_embed, "weight")
+            and target_embed.weight.shape == draft_embed.weight.shape
+        ):
+            del self.model.model.embed_tokens
+            self.model.model.embed_tokens = target_embed
+            logger.info("CPU draft model: sharing embedding weights with target model.")
 
     @override
     def _maybe_share_lm_head(self, target_language_model: nn.Module) -> None:
-        # Draft models don't share lm_head with the target model
-        pass
+        if self.device != torch.device("cpu"):
+            return
+        # Share lm_head only if shapes match (same hidden_size and vocab_size).
+        target_lm_head = getattr(target_language_model, "lm_head", None)
+        draft_lm_head = getattr(self.model, "lm_head", None)
+        if (
+            target_lm_head is not None
+            and draft_lm_head is not None
+            and hasattr(target_lm_head, "weight")
+            and hasattr(draft_lm_head, "weight")
+            and target_lm_head.weight.shape == draft_lm_head.weight.shape
+        ):
+            del self.model.lm_head
+            self.model.lm_head = target_lm_head
+            logger.info("CPU draft model: sharing lm_head weights with target model.")
