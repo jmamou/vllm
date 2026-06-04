@@ -234,6 +234,69 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
 
         return attn_metadata
 
+    def build_for_drafting(
+        self,
+        common_attn_metadata: "CommonAttentionMetadata",
+        draft_index: int,
+    ) -> CPUAttentionMetadata:
+        """Optimized build for draft decode steps.
+
+        During speculative decoding, draft steps are always decode-only
+        (query_len=1 per request) and seq_lens increment by 1 each step.
+        We reuse the scheduler_metadata from draft_index=0 for subsequent
+        steps since the thread work-partitioning is insensitive to +1 token
+        differences in sequence length.
+        """
+        if draft_index == 0:
+            # First draft step: full build and cache the result
+            metadata = self.build(
+                common_prefix_len=0,
+                common_attn_metadata=common_attn_metadata,
+                fast_build=True,
+            )
+            self._cached_draft_scheduler_metadata = metadata.scheduler_metadata
+            self._cached_draft_num_reqs = common_attn_metadata.num_reqs
+            return metadata
+
+        # Subsequent draft steps: reuse cached scheduler_metadata if batch
+        # size hasn't changed (avoids expensive C++ scheduling call)
+        num_reqs = common_attn_metadata.num_reqs
+        reuse_scheduler = (
+            hasattr(self, "_cached_draft_scheduler_metadata")
+            and self._cached_draft_num_reqs == num_reqs
+        )
+
+        if reuse_scheduler:
+            num_actual_tokens = common_attn_metadata.num_actual_tokens
+            max_seq_len = common_attn_metadata.max_seq_len
+            query_start_loc = common_attn_metadata.query_start_loc
+            seq_lens = common_attn_metadata.seq_lens
+            block_table_tensor = common_attn_metadata.block_table_tensor
+            slot_mapping = common_attn_metadata.slot_mapping
+
+            return CPUAttentionMetadata(
+                isa=self.isa,
+                num_actual_tokens=num_actual_tokens,
+                max_query_len=1,
+                query_start_loc=query_start_loc,
+                max_seq_len=max_seq_len,
+                seq_lens=seq_lens,
+                block_table=block_table_tensor,
+                slot_mapping=slot_mapping,
+                scheduler_metadata=self._cached_draft_scheduler_metadata,
+                causal=True,
+                use_sdpa_prefill=False,
+                num_decode_tokens=0,
+                sdpa_start_loc=query_start_loc,
+            )
+
+        # Fallback to full build if batch changed
+        return self.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata,
+            fast_build=True,
+        )
+
 
 class CPUAttentionBackendImpl(AttentionImpl):
     def __init__(
