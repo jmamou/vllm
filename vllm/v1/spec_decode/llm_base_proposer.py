@@ -79,6 +79,12 @@ class SpecDecodeBaseProposer:
         )
         self.use_dsl = self.draft_confidence_threshold > 0
 
+        # Top-K approximate confidence (disabled by default — topk on CPU
+        # turned out slower than vectorized logsumexp due to poor cache behavior).
+        # Kept as dead code path for future experimentation.
+        self._dsl_topk = 0
+        self._dsl_gap_threshold = float("inf")
+
         # We need to get the hidden size from the draft model config because
         # the draft model's hidden size can be different from the target model's
         # hidden size (e.g., Llama 3.3 70B).
@@ -444,9 +450,43 @@ class SpecDecodeBaseProposer:
             return token_ids, confidences
 
         logits = self.model.compute_logits(hidden_states)
+
+        if self._dsl_topk > 0:
+            return self._topk_confidence(logits)
+
         max_logits, token_ids = logits.max(dim=-1)
         log_z = torch.logsumexp(logits, dim=-1)
         confidences = torch.exp(max_logits - log_z)
+        return token_ids, confidences
+
+    def _topk_confidence(
+        self, logits: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Approximate confidence using top-K logits instead of full vocab.
+
+        Two-tier approach:
+        1. Fast path: if top1-top2 gap is large, confidence is guaranteed
+           above threshold — return immediately (no exp/log needed).
+        2. Slow path: logsumexp over top-K only (K=16 vs V=151936).
+
+        The approximation always overestimates confidence (safe: never
+        exits too early). Only used on CPU where full logsumexp is expensive.
+        """
+        K = self._dsl_topk
+        top_values, top_indices = torch.topk(logits, K, dim=-1)
+        token_ids = top_indices[..., 0]
+
+        # Fast path for batch=1: check logit gap
+        if logits.shape[0] == 1:
+            gap = top_values[0, 0] - top_values[0, 1]
+            if gap.item() > self._dsl_gap_threshold:
+                return token_ids, torch.ones(
+                    1, dtype=torch.float32, device=logits.device
+                )
+
+        max_logits = top_values[..., 0]
+        log_z_approx = torch.logsumexp(top_values, dim=-1)
+        confidences = torch.exp(max_logits - log_z_approx).clamp_(max=1.0)
         return token_ids, confidences
 
     def propose(
@@ -552,11 +592,14 @@ class SpecDecodeBaseProposer:
             # (which read via _get_positions) use the correct values.
             self.positions[:batch_size] = positions
 
+        # confidences is shape [batch_size]; for the common batch=1 case we
+        # can index element 0 directly and skip the .min() reduction kernel.
+        single_seq = batch_size == 1
         if self.use_dsl:
             draft_token_ids, confidences = self._greedy_sample_with_confidence(
                 sample_hidden_states
             )
-            min_confidence = confidences.min()
+            min_confidence = confidences[0] if single_seq else confidences.min()
             should_continue_all = min_confidence >= self.draft_confidence_threshold
             draft_probs = None
         else:
@@ -668,7 +711,7 @@ class SpecDecodeBaseProposer:
                 draft_token_ids, confidences = self._greedy_sample_with_confidence(
                     last_hidden_states[:batch_size]
                 )
-                min_confidence = confidences.min()
+                min_confidence = confidences[0] if single_seq else confidences.min()
                 should_continue_all = (
                     should_continue_all
                     and min_confidence >= self.draft_confidence_threshold

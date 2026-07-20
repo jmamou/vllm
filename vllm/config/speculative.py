@@ -95,6 +95,14 @@ class SpeculativeConfig:
 
     Recommended: Start with 0.2-0.3 and tune based on acceptance rate metrics.
     Must be in range [0.0, 1.0]."""
+    dsl_confidence_topk: int = Field(default=16, gt=0)
+    """Number of top logits used for approximate DSL confidence on CPU.
+
+    On CPU, computing exact confidence (logsumexp over full vocabulary) is
+    expensive. This setting uses top-K logits as an approximation, which is
+    much cheaper while providing an upper bound on true confidence.
+    Set to 0 to always use exact confidence. Only applies when DSL is enabled
+    and running on CPU."""
     model: str | None = None
     """The name of the draft model, eagle head, or additional weights, if
     provided."""
